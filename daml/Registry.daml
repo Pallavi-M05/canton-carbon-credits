@@ -1,0 +1,101 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Registry where
+
+import DA.Date (Year)
+import DA.Set (singleton)
+import CarbonCredit (CarbonCredit(..), ProjectType)
+
+-- | Represents a carbon offset project that has been verified and onboarded by a registry.
+-- Credits can only be issued against an active, approved project contract.
+template Project
+  with
+    registry : Party
+      -- ^ The registry that approved and oversees this project.
+    developer : Party
+      -- ^ The entity that developed and runs the carbon offset project.
+    projectId : Text
+      -- ^ A unique identifier for the project (e.g., "VCS-1984").
+    projectName : Text
+      -- ^ A descriptive name for the project.
+    projectType : ProjectType
+      -- ^ The category of the carbon offset project (e.g., Reforestation).
+    description : Text
+      -- ^ A brief description of the project's goals and methodology.
+  where
+    signatory registry, developer
+
+    key (registry, projectId) : (Party, Text)
+    maintainer key._1
+
+    ensure projectId /= "" && projectName /= ""
+
+-- | Represents the role of an authorized carbon credit registry on the network.
+-- This contract is typically created by a regulator, granting a party the right
+-- to onboard projects and issue credits.
+template RegistryRole
+  with
+    registry : Party
+      -- ^ The party acting as the registry.
+    regulator : Party
+      -- ^ The regulatory body that authorized this registry.
+  where
+    signatory registry, regulator
+
+    key registry : Party
+    maintainer key
+
+    -- | A registry can onboard a new carbon offset project, making it eligible for
+    -- credit issuance. This creates a `Project` contract on the ledger, co-signed
+    -- by the project developer.
+    choice OnboardProject : ContractId Project
+      with
+        developer : Party
+        projectId : Text
+        projectName : Text
+        projectType : ProjectType
+        description : Text
+      controller registry
+      do
+        create Project with
+          registry
+          developer
+          projectId
+          projectName
+          projectType
+          description
+
+    -- | The primary function of a registry: to issue new carbon credits for an
+    -- approved project. This choice verifies the project's existence before creating
+    -- a new `CarbonCredit` contract.
+    choice IssueCredit : ContractId CarbonCredit
+      with
+        projectId : Text
+          -- ^ The ID of the project for which credits are being issued.
+        initialOwner : Party
+          -- ^ The party that will own the newly issued credits (often the project developer).
+        quantity : Decimal
+          -- ^ The number of carbon credits to issue (1 credit = 1 tonne of CO2e).
+        vintageYear : Year
+          -- ^ The year in which the emission reduction for this batch of credits occurred.
+      controller registry
+      do
+        -- Ensure the issuance request is valid.
+        assertMsg "Credit quantity must be positive." (quantity > 0.0)
+
+        -- Fetch the project contract by its key to verify it's approved by this registry.
+        -- This will fail if no such project exists, preventing issuance for unapproved projects.
+        projectCid <- fetchByKey @Project (registry, projectId)
+        let project = projectCid.payload
+
+        -- Create the new carbon credit contract. The regulator is added as an observer
+        -- to maintain oversight of all credit issuance activities.
+        create CarbonCredit with
+          issuer = registry
+          owner = initialOwner
+          quantity
+          vintageYear
+          projectType = project.projectType
+          projectId
+          observers = singleton regulator
