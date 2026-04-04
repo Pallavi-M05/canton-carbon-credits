@@ -1,0 +1,16 @@
+sdk-version: 3.1.0
+name: canton-carbon-credits
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+parties:
+  - RegistryOperator
+  - ProjectDeveloper
+  - CorporateBuyerA
+  - CorporateBuyerB
+  - MarketplaceOperator
+build-options:
+  - --target=2.1
