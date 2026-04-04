@@ -1,0 +1,196 @@
+module CarbonCredit where
+
+import DA.Date (Date, addDays)
+import Daml.Script
+
+-- | Defines the type of carbon offset project. This allows for clear
+-- classification and filtering of credits.
+data ProjectType
+  = Reforestation
+  | RenewableEnergy
+  | MethaneCapture
+  | Other Text
+  deriving (Eq, Show, Ord)
+
+-- | Represents a tradable carbon credit, measured in metric tons of CO2 equivalent.
+-- This contract can be split, transferred, or retired.
+template CarbonCredit
+  with
+    issuer : Party
+      -- ^ The entity that originally issued the credit from a verified project.
+    owner : Party
+      -- ^ The current legal owner of the credit.
+    registry : Party
+      -- ^ The carbon registry that oversees the issuance and retirement process.
+    quantity : Decimal
+      -- ^ The amount of carbon credit in metric tons of CO2e. Supports fractional amounts.
+    vintage : Int
+      -- ^ The year in which the emission reduction or removal occurred.
+    projectType : ProjectType
+      -- ^ The category of the project that generated the credit.
+    projectId : Text
+      -- ^ A unique identifier for the specific carbon offset project.
+    issuanceDate : Date
+      -- ^ The date when the credit was officially issued by the registry.
+
+  where
+    signatory issuer, owner
+
+    observer registry
+
+    ensure quantity > 0.0
+      -- ^ The quantity must be positive.
+
+    key (issuer, projectId, owner, issuanceDate, vintage) : (Party, Text, Party, Date, Int)
+    maintainer key._1
+
+    -- | Transfers ownership of the entire credit to a new party.
+    choice Transfer : ContractId CarbonCredit
+      with
+        newOwner : Party
+          -- ^ The party to whom the credit is being transferred.
+      controller owner
+      do
+        create this with owner = newOwner
+
+    -- | Splits the credit into multiple smaller credit contracts.
+    -- The sum of the split quantities must equal the original quantity.
+    choice Split : [ContractId CarbonCredit]
+      with
+        splitQuantities : [Decimal]
+          -- ^ A list of quantities for the new credit contracts.
+      controller owner
+      do
+        assertMsg "Sum of split quantities must equal the original quantity" $
+          sum splitQuantities == quantity
+        assertMsg "All split quantities must be positive" $
+          all (\q -> q > 0.0) splitQuantities
+
+        forA splitQuantities (\q -> create this with quantity = q)
+
+    -- | Permanently retires the credit, taking it out of circulation.
+    -- This action is irreversible and creates a `RetiredCarbonCredit` record.
+    choice Retire : ContractId RetiredCarbonCredit
+      with
+        retirementDate : Date
+          -- ^ The date of retirement.
+        reason : Optional Text
+          -- ^ An optional reason or description for the retirement.
+      controller owner
+      do
+        assertMsg "Retirement date cannot be before issuance date" $
+          retirementDate >= issuanceDate
+
+        create RetiredCarbonCredit with
+          issuer = issuer
+          retiredBy = owner
+          registry = registry
+          quantity = quantity
+          vintage = vintage
+          projectType = projectType
+          projectId = projectId
+          issuanceDate = issuanceDate
+          retirementDate = retirementDate
+          reason = reason
+
+
+-- | Represents a carbon credit that has been permanently retired.
+-- This contract serves as an immutable, on-ledger proof of retirement
+-- and cannot be transferred or further actioned.
+template RetiredCarbonCredit
+  with
+    issuer : Party
+      -- ^ The original issuer of the credit.
+    retiredBy : Party
+      -- ^ The party who retired the credit to offset their emissions.
+    registry : Party
+      -- ^ The carbon registry that attests to the retirement.
+    quantity : Decimal
+      -- ^ The amount of retired carbon credit in metric tons of CO2e.
+    vintage : Int
+      -- ^ The vintage year of the retired credit.
+    projectType : ProjectType
+      -- ^ The project type of the retired credit.
+    projectId : Text
+      -- ^ The unique project identifier.
+    issuanceDate : Date
+      -- ^ The original issuance date of the credit.
+    retirementDate : Date
+      -- ^ The date the credit was retired.
+    reason : Optional Text
+      -- ^ The reason provided for retirement.
+
+  where
+    signatory issuer, retiredBy, registry
+
+    key (issuer, projectId, retiredBy, retirementDate, vintage) : (Party, Text, Party, Date, Int)
+    maintainer key._1
+
+
+-- | A script to demonstrate the lifecycle of a carbon credit.
+setup : Script ()
+setup = script do
+  -- === Parties ===
+  registry <- allocateParty "CarbonRegistry"
+  issuer <- allocateParty "ProjectDeveloper"
+  corporateA <- allocateParty "CorporateA"
+  corporateB <- allocateParty "CorporateB"
+
+  -- === Dates ===
+  today <- fst <$> getLedgerTime
+  let issuanceDate = today
+  let retirementDate = addDays today 30
+
+  -- === 1. Issuance ===
+  -- The ProjectDeveloper (issuer) issues 1000 credits from a 2023 Reforestation project
+  -- to itself, under the authority of the CarbonRegistry.
+  let initialQuantity = 1000.0
+  creditCid <- submit issuer do
+    create CarbonCredit with
+      issuer = issuer
+      owner = issuer
+      registry = registry
+      quantity = initialQuantity
+      vintage = 2023
+      projectType = Reforestation
+      projectId = "PROJ-AMZ-001"
+      issuanceDate = issuanceDate
+
+  -- === 2. Transfer ===
+  -- The issuer sells the 1000 credits to CorporateA.
+  creditCid_A <- submit issuer do
+    exercise creditCid Transfer with newOwner = corporateA
+
+  -- === 3. Split & Trade ===
+  -- CorporateA keeps 750.5 credits and sells 249.5 to CorporateB.
+  -- First, CorporateA splits the credit.
+  (splitCid1, splitCid2) <- submit corporateA do
+    [cid1, cid2] <- exercise creditCid_A Split with splitQuantities = [750.5, 249.5]
+    pure (cid1, cid2)
+
+  -- Then, CorporateA transfers one of the split contracts to CorporateB.
+  creditCid_B <- submit corporateA do
+    exercise splitCid2 Transfer with newOwner = corporateB
+
+  -- === 4. Retirement ===
+  -- CorporateA retires its 750.5 credits to offset its emissions.
+  retiredCid <- submit corporateA do
+    exercise splitCid1 Retire with
+      retirementDate = retirementDate
+      reason = Some "Offsetting Q3 2024 operational emissions."
+
+  -- === Verification ===
+  -- Verify the state of the ledger.
+  creditA_maybe <- submit corporateA do tryFetch splitCid1
+  assertMsg "Corporate A's credit should have been archived" (creditA_maybe == None)
+
+  creditB <- submitMustFail corporateA do fetch creditCid_B -- Corporate A shouldn't see B's credit
+  creditB' <- submit corporateB do fetch creditCid_B
+  assertMsg "Corporate B should own 249.5 credits" (creditB'.quantity == 249.5)
+
+  retiredCredit <- submit corporateA do fetch retiredCid
+  assertMsg "Retirement record should exist" (retiredCredit.retiredBy == corporateA)
+  assertMsg "Retired quantity should be 750.5" (retiredCredit.quantity == 750.5)
+
+  debug "Carbon credit lifecycle demo completed successfully."
+  pure ()
