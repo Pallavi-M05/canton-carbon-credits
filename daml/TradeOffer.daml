@@ -1,0 +1,60 @@
+module TradeOffer where
+
+import Daml.Finance.Interface.Types.Common.Types (Decimal)
+import CarbonCredit (Credit)
+import DA.Action (assert)
+
+
+-- | Represents an offer from a seller to a buyer to trade a specific quantity
+-- | of carbon credits from a particular batch at a set price.
+-- | This follows a standard proposal/acceptance pattern.
+template TradeOffer
+  with
+    seller : Party
+      -- ^ The party selling the carbon credits. This is the owner of the `creditCid`.
+    buyer : Party
+      -- ^ The party to whom the offer is extended.
+    creditCid : ContractId Credit
+      -- ^ The specific `CarbonCredit.Credit` contract being offered for sale.
+    quantity : Decimal
+      -- ^ The quantity of credits (in metric tons of CO2e) being offered.
+    price : Decimal
+      -- ^ The total price for the specified quantity.
+    currency : Text
+      -- ^ The currency of the price (e.g., "USD", "EUR").
+
+  where
+    signatory seller
+    observer buyer
+
+    ensure 0.0 < quantity && 0.0 <= price
+
+    -- | The `buyer` can accept the offer, which executes the trade.
+    -- | This action will split the original credit contract, creating a new
+    -- | contract for the `buyer` with the traded `quantity`.
+    -- | The settlement of the `price` is assumed to be handled outside of this
+    -- | specific choice, potentially through another on-ledger mechanism or
+    -- | off-ledger payment.
+    choice Accept : ContractId Credit
+      controller buyer
+      do
+        -- Fetch the original credit contract to ensure it's still active
+        -- and owned by the seller.
+        credit <- fetch creditCid
+        assert (credit.owner == seller)
+
+        -- Split the credit. This archives the original `creditCid` and creates
+        -- two new `Credit` contracts: one for the seller with the remaining
+        -- quantity, and one for the buyer with the traded quantity.
+        (_sellerRemainingCid, buyerNewCid) <- exercise creditCid Split with
+          newOwner = buyer
+          splitQuantity = quantity
+
+        return buyerNewCid
+
+    -- | The `seller` can withdraw the offer at any time before it is accepted.
+    choice Withdraw : ()
+      controller seller
+      do
+        -- No further action needed other than archiving the offer itself.
+        pure ()
