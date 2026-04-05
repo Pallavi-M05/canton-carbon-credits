@@ -1,0 +1,167 @@
+module CarbonTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as D
+import DA.Time (time)
+import DA.Optional (isNone)
+
+-- Import the main contract modules
+import CarbonCredit
+import Registry
+import TradeOffer
+import Retirement
+
+-- Helper to check if a contract has been archived.
+-- It queries for the contract and returns true if it's not found.
+isArchived: ContractId a -> Script Bool
+isArchived cid = do
+  res <- queryContractId (toAnyContractId cid)
+  return $ isNone res
+
+-- Test setup: allocates parties for a standard scenario
+setupParties = script do
+  registryAuthority <- allocateParty "RegistryAuthority"
+  registry <- allocateParty "EcoRegistry"
+  projectDeveloper <- allocateParty "GreenProjectsInc"
+  corporate <- allocateParty "EcoCorp"
+  return (registryAuthority, registry, projectDeveloper, corporate)
+
+-- Main test suite for the full carbon credit lifecycle
+carbonLifecycleTest : Script ()
+carbonLifecycleTest = script do
+  (registryAuthority, registry, projectDeveloper, corporate) <- setupParties
+
+  -- === 1. REGISTRY SETUP ===
+  -- The central authority grants the registry the role to issue credits.
+  debug "Step 1: Setting up registry role..."
+  registryRoleCid <- submit registryAuthority do
+    create RegistryRole with
+      registry = registry
+      authority = registryAuthority
+
+  -- === 2. CREDIT ISSUANCE ===
+  -- The registry issues a new batch of credits to a project developer.
+  debug "Step 2: Issuing initial batch of carbon credits..."
+  let issuanceDate = D.date 2024 D.Jan 15
+  let vintageYear = 2023
+  let projectId = "PROJ-AMZ-REFOREST-001"
+  let projectType = "Afforestation/Reforestation"
+
+  initialCreditCid <- submit registry do
+    exercise registryRoleCid IssueCarbonCredit with
+      newOwner = projectDeveloper
+      projectId
+      projectType
+      vintageYear
+      quantity = 1000.0
+      issuanceDate
+      observers = [registryAuthority]
+
+  -- Verify initial issuance
+  initialCredit <- fetch initialCreditCid
+  assertEq initialCredit.owner projectDeveloper
+  assertEq initialCredit.quantity 1000.0
+  debug "Initial credit issued successfully to ProjectDeveloper."
+
+  -- === 3. SPLIT CREDIT ===
+  -- The project developer splits off a portion of their credits to prepare for a sale.
+  debug "Step 3: Splitting credit for trading..."
+  (splitForSaleCid, remainingCid) <- submit projectDeveloper do
+    exercise initialCreditCid Split with splitQuantity = 150.5
+
+  -- Verify split quantities and archival of the original contract
+  splitForSale <- fetch splitForSaleCid
+  remainingCredit <- fetch remainingCid
+  assertEq splitForSale.quantity 150.5
+  assertEq remainingCredit.quantity 849.5
+  assertTrueM (isArchived initialCreditCid)
+  debug "Credit split successfully into 150.5 and 849.5 units."
+
+  -- === 4. TRADE OFFER AND ACCEPTANCE ===
+  -- The developer offers the split portion to a corporate buyer.
+  debug "Step 4: Creating trade offer and accepting it..."
+  tradeOfferCid <- submit projectDeveloper do
+    create TradeOffer with
+      seller = projectDeveloper
+      buyer = corporate
+      creditCid = splitForSaleCid
+      price = 4515.00 -- 150.5 credits @ $30/credit
+      currency = "USD"
+      observers = []
+
+  -- The corporate buyer accepts the offer, triggering the transfer.
+  transferredCreditCid <- submit corporate do
+    exercise tradeOfferCid AcceptTrade
+
+  -- Verify ownership transfer and archival of the offer and original credit.
+  transferredCredit <- fetch transferredCreditCid
+  assertEq transferredCredit.owner corporate
+  assertTrueM (isArchived splitForSaleCid)
+  assertTrueM (isArchived tradeOfferCid)
+  debug "Trade completed. Credit ownership transferred to Corporate."
+
+  -- === 5. FULL RETIREMENT ===
+  -- The corporate buyer retires the entire credit they just purchased.
+  debug "Step 5: Corporate retiring the full credit..."
+  let retirementTime = time (D.date 2024 Apr 22) 10 30 00
+  receiptCid <- submit corporate do
+    exercise transferredCreditCid Retire with
+      reason = "Offsetting Q1 2024 operational emissions."
+      retirementTime
+
+  -- Verify the retirement receipt details and that the credit was archived.
+  receipt <- fetch receiptCid
+  assertEq receipt.retiringParty corporate
+  assertEq receipt.quantity 150.5
+  assertEq receipt.projectId projectId
+  assertTrueM (isArchived transferredCreditCid)
+  debug "Full credit retirement successful. Receipt created."
+
+  -- === 6. PARTIAL RETIREMENT ===
+  -- Test the scenario where a user retires only a fraction of their holdings.
+  debug "Step 6: Testing partial retirement..."
+  -- First, sell another chunk of credits to the corporate.
+  (splitForPartialRetireCid, _finalRemainingCid) <- submit projectDeveloper do
+    exercise remainingCid Split with splitQuantity = 75.0
+
+  tradeOffer2Cid <- submit projectDeveloper do
+    create TradeOffer with
+      seller = projectDeveloper
+      buyer = corporate
+      creditCid = splitForPartialRetireCid
+      price = 2250.00
+      currency = "USD"
+      observers = []
+
+  newCreditForCorpCid <- submit corporate do
+    exercise tradeOffer2Cid AcceptTrade
+
+  -- Now, the corporate retires a fraction of this new credit.
+  let partialRetirementTime = time (D.date 2024 May 1) 9 0 0
+  (partialReceiptCid, creditAfterPartialRetireCid) <- submit corporate do
+    exercise newCreditForCorpCid RetirePartial with
+      retireQuantity = 25.75
+      reason = "Offsetting corporate travel emissions."
+      retirementTime = partialRetirementTime
+
+  -- Verify the partial retirement receipt and the remaining credit balance.
+  partialReceipt <- fetch partialReceiptCid
+  creditAfterPartialRetire <- fetch creditAfterPartialRetireCid
+
+  assertEq partialReceipt.quantity 25.75
+  assertEq creditAfterPartialRetire.quantity (75.0 - 25.75)
+  assertEq creditAfterPartialRetire.owner corporate
+  assertTrueM (isArchived newCreditForCorpCid)
+  debug "Partial retirement successful. Receipt created and remaining credit is active."
+
+  -- === 7. FAILURE CASE: UNAUTHORIZED ACTION ===
+  -- Verify that a party cannot exercise a choice on a contract they don't control.
+  debug "Step 7: Testing unauthorized action (must fail)..."
+  -- The corporate (non-owner) tries to split the developer's remaining credit.
+  -- This must fail because only the owner is a controller on the `Split` choice.
+  submitMustFail corporate do
+    exercise _finalRemainingCid Split with splitQuantity = 10.0
+  debug "Unauthorized action failed as expected."
+
+  debug "All carbon credit lifecycle tests passed successfully."
