@@ -1,0 +1,45 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Retirement where
+
+import DA.Date
+import DA.Time
+
+-- | Represents the permanent, on-ledger record of a retired carbon credit.
+-- This contract is created when a `CarbonCredit` contract is exercised for retirement.
+-- It serves as an immutable audit trail, proving that a specific quantity of credits
+-- from a particular project and vintage has been taken out of circulation.
+-- The dual signatory model (registry and owner) ensures non-repudiation from both the
+-- issuer and the retiring party.
+template CarbonCreditRetirement
+  with
+    registry: Party
+      -- ^ The authority that originally issued the credit.
+    owner: Party
+      -- ^ The party that owned and retired the credit.
+    quantity: Decimal
+      -- ^ The amount of carbon credit retired, in metric tons of CO2 equivalent.
+    vintageYear: Int
+      -- ^ The year in which the emission reduction occurred.
+    projectType: Text
+      -- ^ The category of the carbon offset project (e.g., "Reforestation", "Renewable Energy").
+    projectId: Text
+      -- ^ A unique identifier for the specific project that generated the credit.
+    issuanceDate: Date
+      -- ^ The original date when the credit was issued by the registry.
+    retirementDate: Time
+      -- ^ The timestamp when the credit was retired.
+    reason: Text
+      -- ^ The stated purpose for the retirement, e.g., "Offsetting Q4 2024 corporate emissions".
+    beneficiary: Optional Party
+      -- ^ The entity on whose behalf the credit is being retired.
+      -- If `None`, the owner is the beneficiary.
+  where
+    signatory registry, owner
+
+    ensure quantity > 0.0
+
+    -- This contract is terminal and has no choices. It represents a fact that cannot be
+    -- altered. A regulator could be added as an observer or given archival rights
+    -- in a more complex workflow for handling errors or fraudulent activities.
