@@ -1,196 +1,211 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module CarbonCredit where
 
-import DA.Date (Date, addDays)
 import Daml.Script
 
--- | Defines the type of carbon offset project. This allows for clear
--- classification and filtering of credits.
-data ProjectType
-  = Reforestation
-  | RenewableEnergy
-  | MethaneCapture
-  | Other Text
+import DA.Text (Text)
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Next.TotalMap (TotalMap)
+import DA.Date (Date)
+import DA.Time (Time)
+
+-- | A unique identifier for a carbon credit project.
+type ProjectId = Text
+
+-- | A unique identifier for a batch of issued credits.
+type CreditUUID = Text
+
+-- | A composite data type for uniquely identifying a specific issuance batch
+-- | of carbon credits from a project.
+data CreditId = CreditId with
+  projectId : ProjectId
+  uuid : CreditUUID
   deriving (Eq, Show, Ord)
 
--- | Represents a tradable carbon credit, measured in metric tons of CO2 equivalent.
--- This contract can be split, transferred, or retired.
+-- | Represents a batch of fungible carbon credits from a specific project and vintage year.
+-- | Credits are semi-fungible: they can be split and merged, but only with credits
+-- | from the same project and vintage. An issuance workflow (defined elsewhere, e.g., on a
+-- | RegistryRole contract) would create both a `CarbonCredit` for the project owner and
+-- | a `BufferCredit` for the registry's buffer pool.
 template CarbonCredit
   with
-    issuer : Party
-      -- ^ The entity that originally issued the credit from a verified project.
-    owner : Party
-      -- ^ The current legal owner of the credit.
-    registry : Party
-      -- ^ The carbon registry that oversees the issuance and retirement process.
-    quantity : Decimal
-      -- ^ The amount of carbon credit in metric tons of CO2e. Supports fractional amounts.
-    vintage : Int
-      -- ^ The year in which the emission reduction or removal occurred.
-    projectType : ProjectType
-      -- ^ The category of the project that generated the credit.
-    projectId : Text
-      -- ^ A unique identifier for the specific carbon offset project.
-    issuanceDate : Date
-      -- ^ The date when the credit was officially issued by the registry.
-
+    issuer: Party              -- The accredited registry (e.g., Verra, Gold Standard)
+    owner: Party               -- The current owner of the credits
+    quantity: Decimal          -- Amount of credits in tCO2e (tonnes of CO2 equivalent)
+    vintage: Int               -- The year the emission reduction occurred
+    projectId: ProjectId       -- Identifier for the carbon project
+    projectType: Text          -- E.g., "Afforestation/Reforestation", "Renewable Energy"
+    id: CreditId               -- Unique identifier for this credit batch
+    observers: Set Party       -- Additional parties who can see this credit
   where
     signatory issuer, owner
+    observer observers
 
-    observer registry
+    key (issuer, id, owner) : (Party, CreditId, Party)
+    maintainer key.issuer
 
     ensure quantity > 0.0
-      -- ^ The quantity must be positive.
 
-    key (issuer, projectId, owner, issuanceDate, vintage) : (Party, Text, Party, Date, Int)
-    maintainer key._1
-
-    -- | Transfers ownership of the entire credit to a new party.
-    choice Transfer : ContractId CarbonCredit
+    -- | Allows the owner to split a credit holding into two smaller ones.
+    -- | This is essential for trading fractional amounts.
+    choice Split: (ContractId CarbonCredit, ContractId CarbonCredit)
       with
-        newOwner : Party
-          -- ^ The party to whom the credit is being transferred.
+        splitQuantity: Decimal
       controller owner
       do
-        create this with owner = newOwner
+        ensure splitQuantity > 0.0 && splitQuantity < quantity
+        let remainingQuantity = quantity - splitQuantity
+        
+        credit1 <- create this with quantity = splitQuantity
+        credit2 <- create this with quantity = remainingQuantity
+        
+        return (credit1, credit2)
 
-    -- | Splits the credit into multiple smaller credit contracts.
-    -- The sum of the split quantities must equal the original quantity.
-    choice Split : [ContractId CarbonCredit]
+    -- | Initiates a two-phase transfer of the credit to a new owner.
+    -- | Creates a proposal that the new owner must accept to complete the transfer.
+    choice ProposeTransfer: ContractId TransferProposal
       with
-        splitQuantities : [Decimal]
-          -- ^ A list of quantities for the new credit contracts.
+        newOwner: Party
       controller owner
       do
-        assertMsg "Sum of split quantities must equal the original quantity" $
-          sum splitQuantities == quantity
-        assertMsg "All split quantities must be positive" $
-          all (\q -> q > 0.0) splitQuantities
+        create TransferProposal with
+          creditCid = self
+          originalCredit = this
+          newOwner
+          observers = Set.insert newOwner this.observers
 
-        forA splitQuantities (\q -> create this with quantity = q)
-
-    -- | Permanently retires the credit, taking it out of circulation.
-    -- This action is irreversible and creates a `RetiredCarbonCredit` record.
-    choice Retire : ContractId RetiredCarbonCredit
+    -- | Allows the owner to permanently retire a quantity of carbon credits,
+    -- | signifying that the underlying environmental benefit has been claimed.
+    -- | This creates a non-revocable Retirement.Fact contract.
+    -- | This choice supports partial retirement of a credit batch.
+    choice Retire: (Optional (ContractId CarbonCredit), ContractId Retirement.Fact)
       with
-        retirementDate : Date
-          -- ^ The date of retirement.
-        reason : Optional Text
-          -- ^ An optional reason or description for the retirement.
+        retireQuantity: Decimal
+        retirementReason: Text
+        beneficiary: Optional Text -- e.g., "Offsetting Q1 2024 emissions for ACME Corp"
+        metadata: TotalMap Text Text
       controller owner
       do
-        assertMsg "Retirement date cannot be before issuance date" $
-          retirementDate >= issuanceDate
+        ensure retireQuantity > 0.0 && retireQuantity <= quantity
 
-        create RetiredCarbonCredit with
-          issuer = issuer
-          retiredBy = owner
-          registry = registry
-          quantity = quantity
-          vintage = vintage
-          projectType = projectType
-          projectId = projectId
-          issuanceDate = issuanceDate
-          retirementDate = retirementDate
-          reason = reason
+        let
+          remainingQuantity = quantity - retireQuantity
+          maybeRemainingCreditCid =
+            if remainingQuantity > 0.0 then
+              Some <$> create this with quantity = remainingQuantity
+            else
+              None
+
+        -- Create the public retirement fact, which is defined in Retirement.daml
+        retirementFactCid <- create Retirement.Fact with
+          retiringParty = owner
+          issuer
+          quantity = retireQuantity
+          vintage
+          projectId
+          projectType
+          retirementReason
+          beneficiary
+          metadata
+          retiredAt = getTime
+
+        return (maybeRemainingCreditCid, retirementFactCid)
 
 
--- | Represents a carbon credit that has been permanently retired.
--- This contract serves as an immutable, on-ledger proof of retirement
--- and cannot be transferred or further actioned.
-template RetiredCarbonCredit
+-- | Proposal for transferring a CarbonCredit contract. The `newOwner` must accept.
+template TransferProposal
   with
-    issuer : Party
-      -- ^ The original issuer of the credit.
-    retiredBy : Party
-      -- ^ The party who retired the credit to offset their emissions.
-    registry : Party
-      -- ^ The carbon registry that attests to the retirement.
-    quantity : Decimal
-      -- ^ The amount of retired carbon credit in metric tons of CO2e.
-    vintage : Int
-      -- ^ The vintage year of the retired credit.
-    projectType : ProjectType
-      -- ^ The project type of the retired credit.
-    projectId : Text
-      -- ^ The unique project identifier.
-    issuanceDate : Date
-      -- ^ The original issuance date of the credit.
-    retirementDate : Date
-      -- ^ The date the credit was retired.
-    reason : Optional Text
-      -- ^ The reason provided for retirement.
-
+    creditCid: ContractId CarbonCredit
+    originalCredit: CarbonCredit
+    newOwner: Party
+    observers: Set Party
   where
-    signatory issuer, retiredBy, registry
+    signatory originalCredit.owner
+    observer newOwner
 
-    key (issuer, projectId, retiredBy, retirementDate, vintage) : (Party, Text, Party, Date, Int)
-    maintainer key._1
+    choice AcceptTransfer: ContractId CarbonCredit
+      controller newOwner
+      do
+        -- Exercise a fetch on the original contract to ensure it's still active,
+        -- then create the new one in a single atomic transaction.
+        archive creditCid
+        create originalCredit with
+          owner = newOwner
+          observers -- Carry over observers, including the new one
+
+    choice RejectTransfer: ()
+      controller newOwner, originalCredit.owner
+      do pure ()
 
 
--- | A script to demonstrate the lifecycle of a carbon credit.
-setup : Script ()
-setup = script do
-  -- === Parties ===
-  registry <- allocateParty "CarbonRegistry"
-  issuer <- allocateParty "ProjectDeveloper"
-  corporateA <- allocateParty "CorporateA"
-  corporateB <- allocateParty "CorporateB"
+-- | Represents credits allocated to the registry's buffer pool during issuance.
+-- | These credits are used to insure the carbon market against project failures or
+-- | reversals (e.g., a forest fire destroying a carbon sequestration project).
+-- | They are held and controlled exclusively by the registry (`issuer`).
+template BufferCredit
+  with
+    issuer: Party              -- The accredited registry
+    quantity: Decimal          -- Amount of credits held in buffer
+    vintage: Int               -- Vintage year of the buffered credits
+    projectId: ProjectId       -- The project that contributed to this buffer pool entry
+    id: CreditId               -- Links to the original issuance batch for traceability
+  where
+    signatory issuer
 
-  -- === Dates ===
-  today <- fst <$> getLedgerTime
-  let issuanceDate = today
-  let retirementDate = addDays today 30
+    key (issuer, id) : (Party, CreditId)
+    maintainer key.issuer
 
-  -- === 1. Issuance ===
-  -- The ProjectDeveloper (issuer) issues 1000 credits from a 2023 Reforestation project
-  -- to itself, under the authority of the CarbonRegistry.
-  let initialQuantity = 1000.0
-  creditCid <- submit issuer do
-    create CarbonCredit with
-      issuer = issuer
-      owner = issuer
-      registry = registry
-      quantity = initialQuantity
-      vintage = 2023
-      projectType = Reforestation
-      projectId = "PROJ-AMZ-001"
-      issuanceDate = issuanceDate
+    ensure quantity > 0.0
 
-  -- === 2. Transfer ===
-  -- The issuer sells the 1000 credits to CorporateA.
-  creditCid_A <- submit issuer do
-    exercise creditCid Transfer with newOwner = corporateA
+    -- | Choice for the registry to use buffer credits to cover a shortfall or reversal
+    -- | in a project. This archives the buffer credit and creates a public fact about its usage.
+    choice CoverReversal: ContractId BufferReversalFact
+      with
+        reversalReason: Text
+        reversedProjectId: ProjectId -- The project that failed and is being covered
+      controller issuer
+      do
+        create BufferReversalFact with
+          registry = issuer
+          usedQuantity = quantity
+          bufferVintage = vintage
+          bufferSourceProjectId = projectId
+          reversedProjectId
+          reversalReason
+          coveredAt = getTime
 
-  -- === 3. Split & Trade ===
-  -- CorporateA keeps 750.5 credits and sells 249.5 to CorporateB.
-  -- First, CorporateA splits the credit.
-  (splitCid1, splitCid2) <- submit corporateA do
-    [cid1, cid2] <- exercise creditCid_A Split with splitQuantities = [750.5, 249.5]
-    pure (cid1, cid2)
+-- | A public, immutable fact recording the use of buffer credits by a registry.
+-- | This provides transparency and auditability for the insurance mechanism of the carbon market.
+template BufferReversalFact
+  with
+    registry: Party
+    usedQuantity: Decimal
+    bufferVintage: Int
+    bufferSourceProjectId: ProjectId
+    reversedProjectId: ProjectId
+    reversalReason: Text
+    coveredAt: Time
+  where
+    signatory registry
 
-  -- Then, CorporateA transfers one of the split contracts to CorporateB.
-  creditCid_B <- submit corporateA do
-    exercise splitCid2 Transfer with newOwner = corporateB
 
-  -- === 4. Retirement ===
-  -- CorporateA retires its 750.5 credits to offset its emissions.
-  retiredCid <- submit corporateA do
-    exercise splitCid1 Retire with
-      retirementDate = retirementDate
-      reason = Some "Offsetting Q3 2024 operational emissions."
-
-  -- === Verification ===
-  -- Verify the state of the ledger.
-  creditA_maybe <- submit corporateA do tryFetch splitCid1
-  assertMsg "Corporate A's credit should have been archived" (creditA_maybe == None)
-
-  creditB <- submitMustFail corporateA do fetch creditCid_B -- Corporate A shouldn't see B's credit
-  creditB' <- submit corporateB do fetch creditCid_B
-  assertMsg "Corporate B should own 249.5 credits" (creditB'.quantity == 249.5)
-
-  retiredCredit <- submit corporateA do fetch retiredCid
-  assertMsg "Retirement record should exist" (retiredCredit.retiredBy == corporateA)
-  assertMsg "Retired quantity should be 750.5" (retiredCredit.quantity == 750.5)
-
-  debug "Carbon credit lifecycle demo completed successfully."
-  pure ()
+-- | Placeholder for the Retirement contract, which is formally defined in `Retirement.daml`.
+-- | This allows this module to compile independently while referencing the `Retirement.Fact` template.
+module Retirement where
+  template Fact
+    with
+      retiringParty: Party
+      issuer: Party
+      quantity: Decimal
+      vintage: Int
+      projectId: ProjectId
+      projectType: Text
+      retirementReason: Text
+      beneficiary: Optional Text
+      metadata: TotalMap Text Text
+      retiredAt: Time
+    where
+      signatory retiringParty, issuer
